@@ -21,6 +21,67 @@ export async function handleServerAPI(request, env, sys) {
   });
 }
 
+export async function handleServersAPI(request, env, sys) {
+  if (sys.is_public !== 'true' && !checkAuth(request, env)) {
+    return authResponse(sys.site_title);
+  }
+
+  const { results } = await env.DB.prepare(
+    'SELECT * FROM servers ORDER BY server_group, name'
+  ).all();
+  
+  const now = Date.now();
+  const globalOnline = results.filter(s => (now - new Date(s.last_updated).getTime()) < 120000).length;
+  const globalOffline = results.length - globalOnline;
+  
+  let globalSpeedIn = 0, globalSpeedOut = 0, globalNetTx = 0, globalNetRx = 0;
+  const countryStats = {};
+  
+  for (const server of results) {
+    const lastUpdated = new Date(server.last_updated).getTime();
+    const isOnline = (now - lastUpdated) < 120000;
+    
+    if (isOnline) {
+      globalSpeedIn += parseFloat(server.net_in_speed) || 0;
+      globalSpeedOut += parseFloat(server.net_out_speed) || 0;
+    }
+    
+    const rx_val = sys.auto_reset_traffic === 'true' 
+      ? parseFloat(server.monthly_rx || 0) 
+      : parseFloat(server.net_rx || 0);
+    const tx_val = sys.auto_reset_traffic === 'true' 
+      ? parseFloat(server.monthly_tx || 0) 
+      : parseFloat(server.net_tx || 0);
+    
+    globalNetTx += tx_val;
+    globalNetRx += rx_val;
+    
+    let cCode = (server.country || 'xx').toUpperCase();
+    if (cCode === 'TW') cCode = 'CN';
+    if (cCode !== 'XX') {
+      countryStats[cCode] = (countryStats[cCode] || 0) + 1;
+    }
+  }
+  
+  const data = {
+    servers: results,
+    stats: {
+      total: results.length,
+      online: globalOnline,
+      offline: globalOffline,
+      globalSpeedIn,
+      globalSpeedOut,
+      globalNetTx,
+      globalNetRx
+    },
+    countryStats
+  };
+  
+  return new Response(JSON.stringify(data), { 
+    headers: { 'Content-Type': 'application/json' } 
+  });
+}
+
 export async function handleDashboard(request, env, sys) {
   if (sys.is_public !== 'true' && !checkAuth(request, env)) {
     return authResponse(sys.site_title);
@@ -213,7 +274,7 @@ export async function handleDashboard(request, env, sys) {
             <td style="text-align:center;"><div class="status-indicator" style="background:${statusColor}; display:inline-block; margin:0; width:8px; height:8px;"></div></td>
             <td><b>${server.name}</b></td>
             <td>${flagHtml} ${cCode.toUpperCase()}</td>
-            <td><span class="os-label">${server.os || 'Linux'} / ${server.arch || 'KVM'}</span></td>
+            <td><span class="os-label">${server.arch || 'KVM'} / ${server.cpu_cores || 'N/A'}C</span></td>
             <td>
               <div class="table-stat">
                 <div class="stat-bar-container" style="width:60px;">
@@ -931,9 +992,206 @@ export async function handleDashboard(request, env, sys) {
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script id="sys-config" type="application/json">${JSON.stringify({
+    show_price: sys.show_price === 'true',
+    show_expire: sys.show_expire === 'true',
+    show_bw: sys.show_bw === 'true',
+    show_tf: sys.show_tf === 'true',
+    auto_reset_traffic: sys.auto_reset_traffic === 'true'
+  })}</script>
   <script>
     let mapInitialized = false;
     let currentFilter = 'all';
+    const sysConfig = JSON.parse(document.getElementById('sys-config').textContent);
+    
+    function formatBytes(bytes) {
+      bytes = parseFloat(bytes) || 0;
+      if (bytes === 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+    
+    function getPingColor(ping) {
+      ping = parseInt(ping) || 0;
+      if (ping === 0) return 'var(--accent-red)';
+      if (ping < 100) return 'var(--accent-green)';
+      if (ping < 200) return 'var(--accent-yellow)';
+      return 'var(--accent-red)';
+    }
+    
+    function renderFilters(countryStats, totalServers) {
+      let html = '<span class="filter-tag active" data-filter="all">[All] ' + totalServers + '</span>';
+      const sorted = Object.entries(countryStats).sort();
+      for (const [code, count] of sorted) {
+        const cLower = code.toLowerCase();
+        html += '<span class="filter-tag" data-filter="' + cLower + '">';
+        html += '<img src="https://flagcdn.com/16x12/' + cLower + '.png" alt="' + code + '"> ' + code + ' [' + count + ']';
+        html += '</span>';
+      }
+      return html;
+    }
+    
+    function renderCards(servers, now) {
+      const groups = {};
+      for (const server of servers) {
+        const grpName = server.server_group || '默认分组';
+        if (!groups[grpName]) groups[grpName] = [];
+        groups[grpName].push(server);
+      }
+      
+      if (Object.keys(groups).length === 0) {
+        return '<div class="empty-state">[!] 暂无服务器，请在 <a href="/admin" style="color: var(--accent-cyan);">后台管理</a> 中添加</div>';
+      }
+      
+      let html = '';
+      for (const [grpName, grpServers] of Object.entries(groups)) {
+        html += '<div class="group-section">';
+        html += '<div class="group-header" data-group="' + grpName + '">';
+        html += '<span class="prompt-sign">#</span> ' + grpName + ' <span class="group-count">[' + grpServers.length + ']</span>';
+        html += '</div>';
+        html += '<div class="servers-grid">';
+        
+        for (const server of grpServers) {
+          const lastUpdated = new Date(server.last_updated).getTime();
+          const isOnline = (now - lastUpdated) < 120000;
+          const statusColor = isOnline ? 'var(--accent-green)' : 'var(--accent-red)';
+          const statusText = isOnline ? 'ONLINE' : 'OFFLINE';
+          const cpu = parseFloat(server.cpu || 0).toFixed(1);
+          const ram = parseFloat(server.ram || 0).toFixed(1);
+          const disk = parseFloat(server.disk || 0).toFixed(1);
+          const netInSpeed = formatBytes(server.net_in_speed);
+          const netOutSpeed = formatBytes(server.net_out_speed);
+          const monthlyRx = formatBytes(server.monthly_rx);
+          const monthlyTx = formatBytes(server.monthly_tx);
+          const cCode = (server.country || 'xx').toLowerCase();
+          const flagHtml = cCode !== 'xx' 
+            ? '<img src="https://flagcdn.com/24x18/' + cCode + '.png" alt="' + cCode + '" style="vertical-align: middle; margin-right: 5px; border-radius: 2px; filter: brightness(0.9);">' 
+            : '🏳️';
+          
+          let metaHtml = '';
+          if (sysConfig.show_price) {
+            metaHtml += '<div class="card-meta">💰 ' + (server.price || '免费') + '</div>';
+          }
+          if (sysConfig.show_expire) {
+            let expireText = '永久';
+            if (server.expire_date) {
+              const expTime = new Date(server.expire_date).getTime();
+              if (!isNaN(expTime)) {
+                const diff = expTime - now;
+                expireText = diff > 0 
+                  ? Math.ceil(diff / (1000 * 3600 * 24)) + 'd' 
+                  : '<span style="color:var(--accent-red);">EXPIRED</span>';
+              }
+            }
+            metaHtml += '<div class="card-meta">📅 ' + expireText + '</div>';
+          }
+          
+          let badgesHtml = '';
+          if (sysConfig.show_bw && server.bandwidth) 
+            badgesHtml += '<span class="badge badge-bw">' + server.bandwidth + '</span>';
+          if (sysConfig.show_tf && server.traffic_limit) 
+            badgesHtml += '<span class="badge badge-tf">' + server.traffic_limit + '</span>';
+          if (server.ip_v4 === '1') badgesHtml += '<span class="badge badge-v4">IPv4</span>';
+          if (server.ip_v6 === '1') badgesHtml += '<span class="badge badge-v6">IPv6</span>';
+          
+          const pingHtml = '<div class="ping-panel">' +
+            '<div class="ping-item"><span class="ping-label">CT</span><span class="ping-value" style="color:' + getPingColor(server.ping_ct) + '">' + (server.ping_ct === '0' ? 'TIMEOUT' : server.ping_ct + 'ms') + '</span></div>' +
+            '<div class="ping-item"><span class="ping-label">CU</span><span class="ping-value" style="color:' + getPingColor(server.ping_cu) + '">' + (server.ping_cu === '0' ? 'TIMEOUT' : server.ping_cu + 'ms') + '</span></div>' +
+            '<div class="ping-item"><span class="ping-label">CM</span><span class="ping-value" style="color:' + getPingColor(server.ping_cm) + '">' + (server.ping_cm === '0' ? 'TIMEOUT' : server.ping_cm + 'ms') + '</span></div>' +
+            '<div class="ping-item"><span class="ping-label">BD</span><span class="ping-value" style="color:' + getPingColor(server.ping_bd) + '">' + (server.ping_bd === '0' ? 'TIMEOUT' : server.ping_bd + 'ms') + '</span></div>' +
+          '</div>';
+          
+          html += '<a href="/?id=' + server.id + '" class="server-card" data-country="' + cCode + '">' +
+            '<div class="server-card-header">' +
+              '<div class="server-identity">' +
+                '<div class="status-indicator" style="background:' + statusColor + '; box-shadow: 0 0 8px ' + statusColor + ';"></div>' +
+                flagHtml +
+                '<span class="server-name">' + server.name + '</span>' +
+              '</div>' +
+              '<span class="status-label" style="color:' + statusColor + '; border-color:' + statusColor + ';">' + statusText + '</span>' +
+            '</div>' +
+            '<div class="server-meta">' + metaHtml + '<div class="card-badges">' + badgesHtml + '</div></div>' +
+            '<div class="server-stats">' +
+              '<div class="stat-row"><span class="stat-key">CPU</span><div class="stat-bar-container"><div class="stat-bar-fill" style="width:' + cpu + '%; background: var(--accent-cyan);"></div></div><span class="stat-value">' + cpu + '%</span></div>' +
+              '<div class="stat-row"><span class="stat-key">RAM</span><div class="stat-bar-container"><div class="stat-bar-fill" style="width:' + ram + '%; background: var(--accent-purple);"></div></div><span class="stat-value">' + ram + '%</span></div>' +
+              '<div class="stat-row"><span class="stat-key">DISK</span><div class="stat-bar-container"><div class="stat-bar-fill" style="width:' + disk + '%; background: var(--accent-green);"></div></div><span class="stat-value">' + disk + '%</span></div>' +
+              '<div class="stat-row"><span class="stat-key">NET</span><span class="net-down">▼ ' + netInSpeed + '/s</span><span class="net-up">▲ ' + netOutSpeed + '/s</span></div>' +
+              '<div class="stat-row"><span class="stat-key">TRF</span><span class="net-down">▼ ' + monthlyRx + '</span><span class="net-up">▲ ' + monthlyTx + '</span></div>' +
+            '</div>' +
+            pingHtml +
+          '</a>';
+        }
+        
+        html += '</div></div>';
+      }
+      return html;
+    }
+    
+    function renderTable(servers, now) {
+      if (servers.length === 0) {
+        return '<tr><td colspan="12" style="text-align:center; color:var(--text-muted);">[*] No data available</td></tr>';
+      }
+      
+      let html = '';
+      for (const server of servers) {
+        const lastUpdated = new Date(server.last_updated).getTime();
+        const isOnline = (now - lastUpdated) < 120000;
+        const statusColor = isOnline ? 'var(--accent-green)' : 'var(--accent-red)';
+        const cpu = parseFloat(server.cpu || 0).toFixed(1);
+        const ram = parseFloat(server.ram || 0).toFixed(1);
+        const disk = parseFloat(server.disk || 0).toFixed(1);
+        const netInSpeed = formatBytes(server.net_in_speed);
+        const netOutSpeed = formatBytes(server.net_out_speed);
+        const monthlyRx = formatBytes(server.monthly_rx);
+        const monthlyTx = formatBytes(server.monthly_tx);
+        const cCode = (server.country || 'xx').toLowerCase();
+        const flagHtml = cCode !== 'xx' 
+          ? '<img src="https://flagcdn.com/24x18/' + cCode + '.png" alt="' + cCode + '" style="vertical-align: middle; border-radius: 2px; filter: brightness(0.9);">' 
+          : '🏳️';
+        const updateSec = Math.round((now - lastUpdated) / 1000);
+        
+        html += '<tr onclick="window.location.href=\\\'/?id=' + server.id + '\\\'" style="cursor:pointer;" data-country="' + cCode + '">' +
+          '<td style="text-align:center;"><div class="status-indicator" style="background:' + statusColor + '; display:inline-block; margin:0; width:8px; height:8px;"></div></td>' +
+          '<td><b>' + server.name + '</b></td>' +
+          '<td>' + flagHtml + ' ' + cCode.toUpperCase() + '</td>' +
+          '<td><span class="os-label">' + server.arch + ' / ' + (server.cpu_cores || 'N/A') + 'C</span></td>' +
+          '<td><div class="table-stat"><div class="stat-bar-container" style="width:60px;"><div class="stat-bar-fill" style="width:' + cpu + '%; background: var(--accent-cyan);"></div></div><span>' + cpu + '%</span></div></td>' +
+          '<td><div class="table-stat"><div class="stat-bar-container" style="width:60px;"><div class="stat-bar-fill" style="width:' + ram + '%; background: var(--accent-purple);"></div></div><span>' + ram + '%</span></div></td>' +
+          '<td><div class="table-stat"><div class="stat-bar-container" style="width:60px;"><div class="stat-bar-fill" style="width:' + disk + '%; background: var(--accent-green);"></div></div><span>' + disk + '%</span></div></td>' +
+          '<td>' + netInSpeed + '/s</td>' +
+          '<td>' + netOutSpeed + '/s</td>' +
+          '<td>' + monthlyRx + '</td>' +
+          '<td>' + monthlyTx + '</td>' +
+          '<td class="update-time">' + updateSec + 's ago</td>' +
+        '</tr>';
+      }
+      return html;
+    }
+    
+    function renderStats(stats) {
+      const trafficLabel = sysConfig.auto_reset_traffic ? '[MONTH]' : '';
+      return '<div class="stat-item">' +
+        '<div class="stat-label">Total Servers</div>' +
+        '<div class="stat-main-value">' + stats.total + '</div>' +
+        '<div class="stat-sub-info">' +
+          '<span style="color:var(--accent-green);">ON:' + stats.online + '</span> | ' +
+          '<span style="color:var(--accent-red);">OFF:' + stats.offline + '</span>' +
+        '</div>' +
+      '</div>' +
+      '<div class="stat-item">' +
+        '<div class="stat-label">Total Traffic ' + trafficLabel + '</div>' +
+        '<div class="stat-main-value" style="font-size:16px;">' + formatBytes(stats.globalNetRx) + ' ↓ | ↑ ' + formatBytes(stats.globalNetTx) + '</div>' +
+      '</div>' +
+      '<div class="stat-item">' +
+        '<div class="stat-label">Real-time Speed</div>' +
+        '<div class="stat-main-value" style="font-size:16px;">' +
+          '<span style="color:var(--accent-green);">↓ ' + formatBytes(stats.globalSpeedIn) + '/s</span> | ' +
+          '<span style="color:var(--accent-blue);">↑ ' + formatBytes(stats.globalSpeedOut) + '/s</span>' +
+        '</div>' +
+      '</div>';
+    }
 
     function switchView(viewName) {
       document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
@@ -949,16 +1207,6 @@ export async function handleDashboard(request, env, sys) {
         setTimeout(() => window.myMap.invalidateSize(), 100);
       }
     }
-
-    // 国家过滤器
-    document.querySelectorAll('.filter-tag').forEach(tag => {
-      tag.addEventListener('click', function() {
-        document.querySelectorAll('.filter-tag').forEach(t => t.classList.remove('active'));
-        this.classList.add('active');
-        currentFilter = this.dataset.filter;
-        applyFilter();
-      });
-    });
 
     function applyFilter() {
       const cards = document.querySelectorAll('.server-card');
@@ -976,14 +1224,12 @@ export async function handleDashboard(request, env, sys) {
         }
       });
       
-      // 隐藏空分组
       document.querySelectorAll('.group-section').forEach(section => {
         const visibleCards = section.querySelectorAll('.server-card:not([style*="display: none"])');
         section.style.display = visibleCards.length === 0 ? 'none' : '';
       });
     }
 
-    // 地图初始化
     const countryCoords = {
       'US': [37.09, -95.71], 'CN': [35.86, 104.19], 'JP': [36.20, 138.25], 'HK': [22.31, 114.16],
       'SG': [1.35, 103.81], 'KR': [35.90, 127.76], 'DE': [51.16, 10.45], 'GB': [55.37, -3.43],
@@ -1013,7 +1259,6 @@ export async function handleDashboard(request, env, sys) {
         minZoom: 1
       }).setView([30, 10], 2);
 
-      // 添加终端风格的缩放控制
       L.control.zoom({
         position: 'bottomright'
       }).addTo(window.myMap);
@@ -1039,7 +1284,7 @@ export async function handleDashboard(request, env, sys) {
       else markersLayer = L.layerGroup().addTo(window.myMap);
 
       const data = JSON.parse(newDataStr);
-      const isDark = true; // Terminal风格始终为暗色
+      const isDark = true;
 
       const activeIso3 = {};
       for (const code in data) {
@@ -1070,33 +1315,46 @@ export async function handleDashboard(request, env, sys) {
         }
       }
     }
+    
+    function bindFilterEvents() {
+      document.querySelectorAll('.filter-tag').forEach(tag => {
+        tag.addEventListener('click', function() {
+          document.querySelectorAll('.filter-tag').forEach(t => t.classList.remove('active'));
+          this.classList.add('active');
+          currentFilter = this.dataset.filter;
+          applyFilter();
+        });
+      });
+    }
 
-    // 恢复上次视图
     document.addEventListener('DOMContentLoaded', () => {
       const savedView = localStorage.getItem('monitor_preferred_view') || 'card';
       switchView(savedView);
+      bindFilterEvents();
     });
 
-    // AJAX 自动刷新
-    setInterval(async () => {
+    async function refreshData() {
       try {
-        const res = await fetch(location.href);
-        const htmlText = await res.text();
-        const parser = new DOMParser();
-        const newDoc = parser.parseFromString(htmlText, 'text/html');
+        const res = await fetch('/api/servers');
+        if (!res.ok) throw new Error('Failed to fetch');
+        const data = await res.json();
+        const now = Date.now();
         
-        document.getElementById('ajax-stats').innerHTML = newDoc.getElementById('ajax-stats').innerHTML;
-        document.getElementById('ajax-cards').innerHTML = newDoc.getElementById('ajax-cards').innerHTML;
-        document.getElementById('ajax-table').innerHTML = newDoc.getElementById('ajax-table').innerHTML;
-        document.getElementById('ajax-filters').innerHTML = newDoc.getElementById('ajax-filters').innerHTML;
-        document.getElementById('map-data').textContent = newDoc.getElementById('map-data').textContent;
+        document.getElementById('ajax-stats').innerHTML = renderStats(data.stats);
+        document.getElementById('ajax-cards').innerHTML = renderCards(data.servers, now);
+        document.getElementById('ajax-table').innerHTML = renderTable(data.servers, now);
+        document.getElementById('ajax-filters').innerHTML = renderFilters(data.countryStats, data.stats.total);
+        document.getElementById('map-data').textContent = JSON.stringify(data.countryStats);
         
+        bindFilterEvents();
         applyFilter();
         drawMarkers();
       } catch (e) {
-        console.log('[INFO] Refresh pending...');
+        console.log('[INFO] Refresh pending...', e);
       }
-    }, 60000);
+    }
+
+    setInterval(refreshData, 60000);
   </script>
   ${sys.custom_script || ''}
 </body>

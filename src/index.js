@@ -2,7 +2,7 @@ import { initDatabase, cleanupOldData } from './database/schema.js';
 import { handleAdminAPI } from './handlers/admin.js';
 import { handleAdminUI } from './handlers/admin-ui.js';
 import { handleUpdate } from './handlers/update.js';
-import { handleDashboard, handleServerDetail, handleServerAPI } from './handlers/dashboard.js';
+import { handleDashboard, handleServerDetail, handleServerAPI, handleServersAPI } from './handlers/dashboard.js';
 import { loadSettings } from './utils/settings.js';
 
 let dbInitialized = false;
@@ -41,6 +41,11 @@ export default {
     // 服务器详情 JSON API
     if (request.method === 'GET' && url.pathname === '/api/server') {
       return handleServerAPI(request, env, sys);
+    }
+
+    // 服务器列表 JSON API
+    if (request.method === 'GET' && url.pathname === '/api/servers') {
+      return handleServersAPI(request, env, sys);
     }
 
     // 服务器详情 API（24小时历史数据）
