@@ -343,12 +343,14 @@ async function aggregateAndDelete(db, startTime, endTime, bucketSeconds, phaseNa
   return { aggregated, deleted, rawCount };
 }
 
-function getBucketSizeForHours(hours) {
-  if (hours <= 3) return 120;
-  if (hours <= 6) return 240;
-  if (hours <= 24) return 480;
-  if (hours <= 48) return 600;
-  return 900;
+function getBucketSizesForHours(hours) {
+  const sizes = [];
+  if (hours > 1) sizes.push(120);
+  if (hours > 3) sizes.push(240);
+  if (hours > 6) sizes.push(480);
+  if (hours > 24) sizes.push(600);
+  if (hours > 48) sizes.push(900);
+  return sizes;
 }
 
 function mapColumnsToAggregated(columns) {
@@ -381,20 +383,31 @@ export async function getMetricsHistory(db, serverId, hours, columns) {
   
   const oneHourMs = 60 * 60 * 1000;
   const recentCutoff = now - oneHourMs;
-  const bucketSize = getBucketSizeForHours(hours);
+  const bucketSizes = getBucketSizesForHours(hours);
   const aggColumns = mapColumnsToAggregated(columns);
   
-  const aggResult = await db.prepare(`
-    SELECT 
-      bucket AS timestamp,
-      ${aggColumns}
-    FROM metrics_aggregated
-    WHERE server_id = ?
-      AND bucket_size = ?
-      AND bucket >= ?
-      AND bucket < ?
-    ORDER BY bucket ASC
-  `).bind(serverId, bucketSize, cutoff, recentCutoff).all();
+  let allAggData = [];
+  
+  for (const bucketSize of bucketSizes) {
+    const aggResult = await db.prepare(`
+      SELECT 
+        bucket AS timestamp,
+        ${aggColumns}
+      FROM metrics_aggregated
+      WHERE server_id = ?
+        AND bucket_size = ?
+        AND bucket >= ?
+        AND bucket < ?
+      ORDER BY bucket ASC
+    `).bind(serverId, bucketSize, cutoff, recentCutoff).all();
+    
+    const phaseData = aggResult.results.map(row => ({
+      ...row,
+      timestamp: Number(row.timestamp)
+    }));
+    
+    allAggData = allAggData.concat(phaseData);
+  }
   
   const historyResult = await db.prepare(`
     SELECT timestamp, ${columns}
@@ -405,17 +418,12 @@ export async function getMetricsHistory(db, serverId, hours, columns) {
     ORDER BY timestamp ASC
   `).bind(serverId, recentCutoff).all();
   
-  const aggData = aggResult.results.map(row => ({
-    ...row,
-    timestamp: Number(row.timestamp)
-  }));
-  
   const historyData = historyResult.results.map(row => ({
     ...row,
     timestamp: typeof row.timestamp === 'string' ? new Date(row.timestamp).getTime() : Number(row.timestamp)
   }));
   
-  const merged = [...aggData, ...historyData];
+  const merged = [...allAggData, ...historyData];
   merged.sort((a, b) => a.timestamp - b.timestamp);
   
   return merged;
